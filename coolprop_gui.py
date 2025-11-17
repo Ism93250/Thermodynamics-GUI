@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import CoolProp.CoolProp as CP
 import sys
 import time
@@ -22,6 +22,7 @@ except ImportError:
 # --- Plotting Imports ---
 import numpy as np
 import matplotlib
+import csv
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -63,6 +64,20 @@ PINT_UNIT_OPTIONS = {
     "Conductivity": ['W/(m*K)', 'BTU/(ft*hr*degF)'], "Viscosity": ['Pa*s', 'cP'],
     "SpeedOfSound": ['m/s'], "SurfaceTension": ['N/m'], "MolarMass": ['kg/mol', 'lb/mol'],
     "Dimensionless": ['dimensionless'], "Default": ['dimensionless']
+}
+# --- Unit categories for converter (user-friendly) ---
+UNIT_CATEGORIES = {
+    'Temperature': PINT_UNIT_OPTIONS['Temperature'],
+    'Pressure': PINT_UNIT_OPTIONS['Pressure'],
+    'Density': PINT_UNIT_OPTIONS.get('Density', ['kg/m**3']),
+    'Energy': ['J', 'kJ', 'kJ/kg', 'BTU', 'cal'],
+    'Mass': ['kg', 'g', 'lb', 'oz'],
+    'Volume': ['m**3', 'L', 'liter', 'ft**3'],
+    'Specific Energy': PINT_UNIT_OPTIONS.get('SpecificEnergy', ['J/kg']),
+    'Entropy': PINT_UNIT_OPTIONS.get('SpecificEntropy', ['J/(kg*K)']),
+    'Viscosity': PINT_UNIT_OPTIONS.get('Viscosity', ['Pa*s', 'cP']),
+    'Conductivity': PINT_UNIT_OPTIONS.get('Conductivity', ['W/(m*K)']),
+    'Molar Mass': PINT_UNIT_OPTIONS.get('MolarMass', ['kg/mol'])
 }
 PropertyDetails = namedtuple("PropertyDetails", ["prop_type", "si_unit_str", "description"])
 
@@ -413,6 +428,70 @@ class ThermodynamicsCalculator:
         except Exception as e_glob:
              error_msg = f"Unexpected P-T Curve Error: {e_glob}"; logging.error(f"{error_msg} for fluid {fluid_name}", exc_info=True); psat_data['error'] = error_msg
         return psat_data
+
+    def calculate_quality_curves_ph(self, fluid_name, x_list=None, N=80):
+        """Calculate lines of constant quality (x) in P-h space between Pmin and Pcrit.
+        Returns dict: {'x_lines': {x: {'h': [...], 'p': [...]}, ...}, 'error': None}
+        """
+        if x_list is None: x_list = [i/10.0 for i in range(1, 10)]
+        res = {'x_lines': {}, 'error': None}
+        try:
+            pcrit_si = CP.PropsSI('Pcrit', fluid_name)
+            try: pmin_si = CP.PropsSI('Pmin', fluid_name)
+            except ValueError: pmin_si = CP.PropsSI('ptriple', fluid_name)
+            p_start = max(pmin_si * 1.01, 1e-6); p_end = pcrit_si * 0.999
+            if p_start >= p_end or not np.isfinite(p_start) or not np.isfinite(p_end):
+                raise ValueError("Invalid pressure range for quality curves.")
+            p_range_si = np.logspace(np.log10(p_start), np.log10(p_end), N)
+            for x in x_list:
+                h_vals = []
+                p_vals = []
+                for p in p_range_si:
+                    try:
+                        h = CP.PropsSI('H', 'P', p, 'Q', x, fluid_name)
+                        if np.isfinite(h):
+                            h_vals.append(h); p_vals.append(p)
+                    except Exception:
+                        continue
+                if h_vals and p_vals:
+                    h_arr = self.Q_(np.array(h_vals), 'J/kg').to('kJ/kg').m
+                    p_arr = self.Q_(np.array(p_vals), 'pascal').to('kPa').m
+                    res['x_lines'][x] = {'h': h_arr, 'p': p_arr}
+        except Exception as e:
+            res['error'] = f"Quality curve error: {e}"
+        return res
+
+    def calculate_quality_curves_ts(self, fluid_name, x_list=None, N=80):
+        """Calculate lines of constant quality (x) in T-s space between Tmin and Tcrit.
+        Returns dict: {'x_lines': {x: {'s': [...], 't': [...]}, ...}, 'error': None}
+        """
+        if x_list is None: x_list = [i/10.0 for i in range(1, 10)]
+        res = {'x_lines': {}, 'error': None}
+        try:
+            tcrit_si = CP.PropsSI('Tcrit', fluid_name)
+            try: tmin_si = CP.PropsSI('Tmin', fluid_name)
+            except ValueError: tmin_si = CP.PropsSI('Ttriple', fluid_name)
+            t_start = tmin_si * 1.01; t_end = tcrit_si * 0.999
+            if t_start >= t_end or not np.isfinite(t_start) or not np.isfinite(t_end):
+                raise ValueError("Invalid temperature range for quality curves.")
+            t_range_si = np.linspace(t_start, t_end, N)
+            for x in x_list:
+                s_vals = []
+                t_vals = []
+                for t in t_range_si:
+                    try:
+                        s = CP.PropsSI('S', 'T', t, 'Q', x, fluid_name)
+                        if np.isfinite(s):
+                            s_vals.append(s); t_vals.append(t)
+                    except Exception:
+                        continue
+                if s_vals and t_vals:
+                    s_arr = self.Q_(np.array(s_vals), 'J/(kg*K)').to('kJ/(kg*K)').m
+                    t_arr = self.Q_(np.array(t_vals), 'kelvin').to('K').m
+                    res['x_lines'][x] = {'s': s_arr, 't': t_arr}
+        except Exception as e:
+            res['error'] = f"Quality curve error: {e}"
+        return res
     # --- NEW: Refrigeration Cycle Calculation ---
     def calculate_refrigeration_cycle(self, fluid_name, p_evap_pa, p_cond_pa, superheat_k, subcooling_k, eta_compressor):
         """
@@ -626,11 +705,25 @@ class CoolPropApp(tk.Tk):
 
     def _setup_variables(self):
         self.fluid_var = tk.StringVar(value="Water"); self.fluid_filter_var = tk.StringVar()
+        # Mixture builder state: list of (component, fraction)
+        self.mixture_components = []
+        self.mixture_fraction_var = tk.StringVar(value="50")
+        # Plot options
+        self.show_isotherms_var = tk.BooleanVar(value=False); self.show_isobars_var = tk.BooleanVar(value=False)
+        self.show_quality_lines_var = tk.BooleanVar(value=False)
+        # Custom fluid string support
+        self.custom_fluid_var = tk.StringVar(value="")
+
+        # Unit converter variables
+        self.conv_value_var = tk.StringVar(value="1")
+        self.conv_from_unit_var = tk.StringVar(value="kelvin")
+        self.conv_to_unit_var = tk.StringVar(value="degC")
+        self.conv_result_var = tk.StringVar(value="")
+        self.conv_category_var = tk.StringVar(value="Temperature")
         default_prop1_display = self.code_to_display_map.get("T", "Temperature"); default_prop2_display = self.code_to_display_map.get("P", "Pressure")
         self.prop1_name_var = tk.StringVar(value=default_prop1_display); self.prop1_value_var = tk.StringVar(value="25"); self.prop1_unit_var = tk.StringVar()
         self.prop2_name_var = tk.StringVar(value=default_prop2_display); self.prop2_value_var = tk.StringVar(value="1.01325"); self.prop2_unit_var = tk.StringVar()
         self.phase_var = tk.StringVar(value=DEFAULT_PHASE_TEXT); self.fluid_info_tcrit_var = tk.StringVar(value=NA_TEXT); self.fluid_info_pcrit_var = tk.StringVar(value=NA_TEXT); self.fluid_info_molmass_var = tk.StringVar(value=NA_TEXT); self.fluid_info_tmin_var = tk.StringVar(value=NA_TEXT); self.fluid_info_tmax_var = tk.StringVar(value=NA_TEXT)
-        self.show_isotherms_var = tk.BooleanVar(value=False); self.show_isobars_var = tk.BooleanVar(value=False)
         self.rankine_p_boiler_var = tk.StringVar(value="8000"); self.rankine_t_boiler_var = tk.StringVar(value="500"); self.rankine_p_cond_var = tk.StringVar(value="10"); self.rankine_eta_turbine_var = tk.StringVar(value="85")
         self.refrig_p_evap_var = tk.StringVar(value="200") # kPa
         self.refrig_p_cond_var = tk.StringVar(value="1200") # kPa
@@ -665,6 +758,9 @@ class CoolPropApp(tk.Tk):
         # --- NEW P-T Saturation Tab Setup ---
         self.psat_plot_tab = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(self.psat_plot_tab, text=PSAT_TAB_TEXT)
+        # Converter tab
+        self.converter_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(self.converter_tab, text=" Convertisseur ")
 
         self.rankine_tab.grid_rowconfigure(1, weight=1); self.rankine_tab.grid_columnconfigure(0, weight=1); self.rankine_tab.grid_columnconfigure(1, weight=2)
         self.refrig_tab.grid_rowconfigure(1, weight=1); self.refrig_tab.grid_columnconfigure(0, weight=1); self.refrig_tab.grid_columnconfigure(1, weight=2)
@@ -680,6 +776,7 @@ class CoolPropApp(tk.Tk):
         self._create_refrig_widgets(self.refrig_tab)
         self._create_psychro_widgets(self.psychro_tab)
         self._create_psat_plot_widgets(self.psat_plot_tab) # NEW Call
+        self._create_converter_widgets(self.converter_tab)
         self._setup_plot_layout()
 
     def _create_calculator_widgets(self, parent_frame):
@@ -688,6 +785,34 @@ class CoolPropApp(tk.Tk):
         ttk.Label(fluid_frame, text="Filter:").grid(row=0, column=0, padx=(5,2), pady=3, sticky="w"); self.fluid_filter_entry = ttk.Entry(fluid_frame, textvariable=self.fluid_filter_var, width=20); self.fluid_filter_entry.grid(row=0, column=1, padx=(0,5), pady=3, sticky="ew")
         fluid_list_frame = ttk.Frame(fluid_frame); fluid_list_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(3,0)); fluid_list_frame.grid_rowconfigure(0, weight=1); fluid_list_frame.grid_columnconfigure(0, weight=1)
         self.fluid_listbox = tk.Listbox(fluid_list_frame, height=6, exportselection=False); fluid_scrollbar = ttk.Scrollbar(fluid_list_frame, orient=tk.VERTICAL, command=self.fluid_listbox.yview); self.fluid_listbox.configure(yscrollcommand=fluid_scrollbar.set); self.fluid_listbox.grid(row=0, column=0, sticky="nsew"); fluid_scrollbar.grid(row=0, column=1, sticky="ns")
+        # --- Mixture Builder ---
+        mixture_frame = ttk.LabelFrame(fluid_frame, text="Mixture Builder", padding="5")
+        mixture_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        ttk.Label(mixture_frame, text="Fraction (%):").grid(row=0, column=0, padx=(5,2), pady=2, sticky="w")
+        self.mixture_fraction_entry = ttk.Entry(mixture_frame, textvariable=self.mixture_fraction_var, width=8)
+        self.mixture_fraction_entry.grid(row=0, column=1, padx=(0,5), pady=2, sticky="w")
+        add_btn = ttk.Button(mixture_frame, text="Add Component", command=self._add_component_to_mixture, width=14)
+        add_btn.grid(row=0, column=2, padx=5, pady=2)
+        apply_btn = ttk.Button(mixture_frame, text="Apply Mixture", command=self._apply_mixture, width=12)
+        apply_btn.grid(row=0, column=3, padx=5, pady=2)
+        clear_btn = ttk.Button(mixture_frame, text="Clear Mixture", command=self._clear_mixture, width=12)
+        clear_btn.grid(row=0, column=4, padx=5, pady=2)
+        # Treeview to show components and fractions
+        self.mixture_tree = ttk.Treeview(mixture_frame, columns=('comp','frac'), show='headings', height=3)
+        self.mixture_tree.heading('comp', text='Component'); self.mixture_tree.heading('frac', text='Frac (%)')
+        self.mixture_tree.column('comp', width=140, anchor=tk.W); self.mixture_tree.column('frac', width=60, anchor=tk.E)
+        self.mixture_tree.grid(row=1, column=0, columnspan=5, sticky='nsew', pady=(4,0))
+        mixture_frame.grid_columnconfigure(1, weight=0); mixture_frame.grid_columnconfigure(2, weight=0); mixture_frame.grid_columnconfigure(3, weight=0); mixture_frame.grid_columnconfigure(4, weight=0)
+        # --- Custom Fluid String ---
+        ttk.Label(fluid_frame, text="Custom Fluid string:").grid(row=3, column=0, padx=5, pady=(8,2), sticky='w')
+        self.custom_fluid_entry = ttk.Entry(fluid_frame, textvariable=self.custom_fluid_var, width=48)
+        self.custom_fluid_entry.grid(row=3, column=1, padx=5, pady=(8,2), sticky='ew')
+        custom_btn_frame = ttk.Frame(fluid_frame)
+        custom_btn_frame.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(2,6))
+        apply_custom_btn = ttk.Button(custom_btn_frame, text='Apply Custom Fluid', command=self._apply_custom_fluid)
+        apply_custom_btn.pack(side=tk.LEFT, padx=(3,8))
+        clear_custom_btn = ttk.Button(custom_btn_frame, text='Clear Custom Fluid', command=self._clear_custom_fluid)
+        clear_custom_btn.pack(side=tk.LEFT)
         self.input_frame = ttk.LabelFrame(left_frame, text="Input Properties", padding="10"); self.input_frame.grid(row=1, column=0, sticky="new", pady=(5, 5))
         ttk.Label(self.input_frame, text="Prop 1:").grid(row=0, column=0, padx=5, pady=3, sticky="w"); self.prop1_name_combo=ttk.Combobox(self.input_frame, textvariable=self.prop1_name_var, values=self.property_display_list, width=18, state="readonly"); self.prop1_name_combo.grid(row=0, column=1, padx=5, pady=3, sticky="ew"); self.prop1_value_entry=ttk.Entry(self.input_frame, textvariable=self.prop1_value_var, width=12); self.prop1_value_entry.grid(row=0, column=2, padx=5, pady=3, sticky="ew"); self.prop1_unit_combo=ttk.Combobox(self.input_frame, textvariable=self.prop1_unit_var, width=10, state="readonly"); self.prop1_unit_combo.grid(row=0, column=3, padx=(0,5), pady=3, sticky="w")
         ttk.Label(self.input_frame, text="Prop 2:").grid(row=1, column=0, padx=5, pady=3, sticky="w"); self.prop2_name_combo=ttk.Combobox(self.input_frame, textvariable=self.prop2_name_var, values=self.property_display_list, width=18, state="readonly"); self.prop2_name_combo.grid(row=1, column=1, padx=5, pady=3, sticky="ew"); self.prop2_value_entry=ttk.Entry(self.input_frame, textvariable=self.prop2_value_var, width=12); self.prop2_value_entry.grid(row=1, column=2, padx=5, pady=3, sticky="ew"); self.prop2_unit_combo=ttk.Combobox(self.input_frame, textvariable=self.prop2_unit_var, width=10, state="readonly"); self.prop2_unit_combo.grid(row=1, column=3, padx=(0,5), pady=3, sticky="w")
@@ -710,7 +835,14 @@ class CoolPropApp(tk.Tk):
         cols = ('prop', 'val', 'unit'); self.result_tree=ttk.Treeview(self.result_frame, columns=cols, show='headings', height=10); self.result_tree.heading('prop', text='Property'); self.result_tree.heading('val', text='Value'); self.result_tree.heading('unit', text='Unit (SI)')
         self.result_tree.column('prop', width=180, anchor=tk.W, stretch=tk.YES); self.result_tree.column('val', width=120, anchor=tk.E, stretch=tk.YES); self.result_tree.column('unit', width=100, anchor=tk.W, stretch=tk.NO)
         result_scroll=ttk.Scrollbar(self.result_frame, orient=tk.VERTICAL, command=self.result_tree.yview); self.result_tree.configure(yscrollcommand=result_scroll.set); self.result_tree.grid(row=0, column=0, sticky='nsew', pady=(0,5)); result_scroll.grid(row=0, column=1, sticky='ns', pady=(0,5))
-        self.copy_button=ttk.Button(self.result_frame, text=COPY_BUTTON_TEXT, width=12, command=self._copy_result_to_clipboard); self.copy_button.grid(row=1, column=0, columnspan=2, pady=5, sticky='e')
+        # Buttons: Export CSV and Copy
+        btn_frame = ttk.Frame(self.result_frame)
+        btn_frame.grid(row=1, column=0, columnspan=2, pady=5, sticky='ew')
+        btn_frame.grid_columnconfigure(0, weight=1); btn_frame.grid_columnconfigure(1, weight=0)
+        self.export_button = ttk.Button(btn_frame, text="Export CSV", width=12, command=self._export_results_csv)
+        self.export_button.grid(row=0, column=0, sticky='w', padx=(3,0))
+        self.copy_button = ttk.Button(btn_frame, text=COPY_BUTTON_TEXT, width=12, command=self._copy_result_to_clipboard)
+        self.copy_button.grid(row=0, column=1, sticky='e', padx=(0,3))
 
     def _create_plot_widgets(self):
         self.ph_fig = Figure(figsize=(7, 5), dpi=100); self.ph_ax = self.ph_fig.add_subplot(111)
@@ -719,7 +851,10 @@ class CoolPropApp(tk.Tk):
         self.ph_toolbar_frame = ttk.Frame(self.ph_plot_tab)
         self.ph_toolbar = NavigationToolbar2Tk(self.ph_canvas, self.ph_toolbar_frame); self.ph_toolbar.update()
         self.isotherms_check = ttk.Checkbutton(self.ph_toolbar_frame, text="Afficher Isotherme(s)", variable=self.show_isotherms_var, command=self._trigger_ph_plot_update)
-        self.isotherms_check.pack(side=tk.RIGHT, padx=5); self.ph_toolbar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.isotherms_check.pack(side=tk.RIGHT, padx=5);
+        self.quality_lines_check = ttk.Checkbutton(self.ph_toolbar_frame, text="Afficher lignes qualité (x)", variable=self.show_quality_lines_var, command=self._trigger_ph_plot_update)
+        self.quality_lines_check.pack(side=tk.RIGHT, padx=5);
+        self.ph_toolbar.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.ph_ax.set_xlabel("Specific Enthalpy (h) [kJ/kg]"); self.ph_ax.set_ylabel("Pressure (P) [kPa]"); self.ph_ax.set_yscale('log'); self.ph_ax.set_title("P-h Diagram"); self.ph_fig.tight_layout()
 
         self.ts_fig = Figure(figsize=(7, 5), dpi=100); self.ts_ax = self.ts_fig.add_subplot(111)
@@ -743,6 +878,84 @@ class CoolPropApp(tk.Tk):
         self.psat_toolbar.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.psat_ax.set_xlabel("Temperature (T) [K]"); self.psat_ax.set_ylabel("Saturation Pressure (P) [kPa]")
         self.psat_ax.set_yscale('log'); self.psat_ax.set_title("P-T Saturation Curve"); self.psat_fig.tight_layout()
+        # --- Binary bubble/dew plot controls ---
+        bin_frame = ttk.Frame(parent_frame)
+        bin_frame.grid(row=2, column=0, sticky='ew', padx=5, pady=(6,0))
+        ttk.Label(bin_frame, text='Binary bubble @ P (kPa):').pack(side=tk.LEFT, padx=(0,6))
+        self.bin_p_var = tk.StringVar(value='101.325')
+        self.bin_p_entry = ttk.Entry(bin_frame, textvariable=self.bin_p_var, width=12)
+        self.bin_p_entry.pack(side=tk.LEFT)
+        self.bin_plot_btn = ttk.Button(bin_frame, text='Tracer bulle binaire', command=self._on_plot_binary_bubble_dew)
+        self.bin_plot_btn.pack(side=tk.LEFT, padx=6)
+
+    def _create_converter_widgets(self, parent_frame):
+        """Creates a simple unit converter using pint."""
+        parent_frame.grid_rowconfigure(0, weight=1); parent_frame.grid_columnconfigure(0, weight=1)
+        frame = ttk.LabelFrame(parent_frame, text="Convertisseur d'unités", padding=10)
+        frame.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
+        frame.grid_columnconfigure(1, weight=1)
+        ttk.Label(frame, text='Valeur:').grid(row=0, column=0, padx=5, pady=4, sticky='w')
+        ttk.Entry(frame, textvariable=self.conv_value_var, width=18).grid(row=0, column=1, padx=5, pady=4, sticky='w')
+
+        ttk.Label(frame, text='Catégorie:').grid(row=1, column=0, padx=5, pady=4, sticky='w')
+        categories = list(UNIT_CATEGORIES.keys())
+        self.conv_category_combo = ttk.Combobox(frame, values=categories, textvariable=self.conv_category_var, state='readonly', width=20)
+        self.conv_category_combo.grid(row=1, column=1, padx=5, pady=4, sticky='w')
+        self.conv_category_combo.bind('<<ComboboxSelected>>', lambda e: self._update_converter_unit_options())
+
+        ttk.Label(frame, text='Unité source:').grid(row=2, column=0, padx=5, pady=4, sticky='w')
+        self.conv_from_combo = ttk.Combobox(frame, values=UNIT_CATEGORIES.get(self.conv_category_var.get(), []), textvariable=self.conv_from_unit_var, state='readonly', width=20)
+        self.conv_from_combo.grid(row=2, column=1, padx=5, pady=4, sticky='w')
+
+        ttk.Label(frame, text='Unité cible:').grid(row=3, column=0, padx=5, pady=4, sticky='w')
+        self.conv_to_combo = ttk.Combobox(frame, values=UNIT_CATEGORIES.get(self.conv_category_var.get(), []), textvariable=self.conv_to_unit_var, state='readonly', width=20)
+        self.conv_to_combo.grid(row=3, column=1, padx=5, pady=4, sticky='w')
+
+        btn_frame = ttk.Frame(frame); btn_frame.grid(row=4, column=0, columnspan=2, pady=6)
+        ttk.Button(btn_frame, text='Convertir', command=self._perform_conversion).pack(side=tk.LEFT, padx=(0,8))
+        ttk.Button(btn_frame, text='Copier résultat', command=lambda: self.clipboard_append(self.conv_result_var.get())).pack(side=tk.LEFT)
+        ttk.Label(frame, text='Résultat:').grid(row=5, column=0, padx=5, pady=4, sticky='w')
+        ttk.Label(frame, textvariable=self.conv_result_var, anchor='w', background='white', relief='sunken').grid(row=5, column=1, padx=5, pady=4, sticky='ew')
+        # Initialize combo selections
+        try:
+            if self.conv_category_var.get() not in UNIT_CATEGORIES: self.conv_category_var.set(categories[0])
+        except Exception:
+            self.conv_category_var.set(categories[0] if categories else '')
+        self._update_converter_unit_options()
+
+    def _perform_conversion(self):
+        try:
+            val = float(self.conv_value_var.get())
+        except Exception:
+            messagebox.showerror('Conversion', 'Valeur invalide.', parent=self); return
+        from_u = self.conv_from_unit_var.get().strip()
+        to_u = self.conv_to_unit_var.get().strip()
+        if not from_u or not to_u:
+            messagebox.showerror('Conversion', 'Spécifiez les unités source et cible.', parent=self); return
+        try:
+            q = self.Q_(val, from_u)
+            q2 = q.to(to_u)
+            self.conv_result_var.set(f"{q2.magnitude:.6g} {q2.units:~P}")
+        except Exception as e:
+            logging.error(f"Conversion failed: {e}", exc_info=True)
+            messagebox.showerror('Conversion Error', f'Cannot convert: {e}', parent=self)
+
+    def _update_converter_unit_options(self):
+        cat = self.conv_category_var.get()
+        units = UNIT_CATEGORIES.get(cat, [])
+        # If category is known, also append items from PINT_UNIT_OPTIONS for that type if matching
+        try:
+            # update combobox value lists
+            if hasattr(self, 'conv_from_combo'):
+                self.conv_from_combo['values'] = units
+                if self.conv_from_unit_var.get() not in units and units:
+                    self.conv_from_unit_var.set(units[0])
+            if hasattr(self, 'conv_to_combo'):
+                self.conv_to_combo['values'] = units
+                if self.conv_to_unit_var.get() not in units and units:
+                    self.conv_to_unit_var.set(units[0])
+        except Exception as e:
+            logging.error(f"Error updating converter units: {e}", exc_info=True)
 
     def _create_rankine_widgets(self, parent_frame):
         input_frame = ttk.LabelFrame(parent_frame, text="Rankine Cycle Inputs", padding="10"); input_frame.grid(row=0, column=0, padx=5, pady=5, sticky="new")
@@ -763,6 +976,12 @@ class CoolPropApp(tk.Tk):
         self.rankine_tree.heading('point', text='State'); self.rankine_tree.heading('T', text='T [K]'); self.rankine_tree.heading('P', text='P [kPa]'); self.rankine_tree.heading('H', text='H [kJ/kg]'); self.rankine_tree.heading('S', text='S [kJ/kg·K]'); self.rankine_tree.heading('Q', text='Quality')
         self.rankine_tree.column('point', width=50, anchor=tk.CENTER, stretch=tk.NO); self.rankine_tree.column('T', width=80, anchor=tk.E, stretch=tk.YES); self.rankine_tree.column('P', width=90, anchor=tk.E, stretch=tk.YES); self.rankine_tree.column('H', width=100, anchor=tk.E, stretch=tk.YES); self.rankine_tree.column('S', width=100, anchor=tk.E, stretch=tk.YES); self.rankine_tree.column('Q', width=70, anchor=tk.E, stretch=tk.YES)
         scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.rankine_tree.yview); self.rankine_tree.configure(yscrollcommand=scroll.set); scroll.grid(row=1, column=1, sticky='ns')
+        # Export button for Rankine results
+        rankine_btn_frame = ttk.Frame(results_frame)
+        rankine_btn_frame.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6,0))
+        rankine_btn_frame.grid_columnconfigure(0, weight=1)
+        self.rankine_export_button = ttk.Button(rankine_btn_frame, text='Export CSV', command=self._export_rankine_csv)
+        self.rankine_export_button.grid(row=0, column=0, sticky='w', padx=5)
 
     def _setup_plot_layout(self):
         self.ph_canvas_widget.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
@@ -808,6 +1027,13 @@ class CoolPropApp(tk.Tk):
         ToolTip(self.output_listbox, "Select outputs (Ctrl+Click, Shift+Click, Dbl-Click to Calculate)"); ToolTip(self.calculate_button, "Calculate selected properties (Enter)"); ToolTip(self.clear_button, "Clear inputs and results"); ToolTip(self.copy_button, "Copy results table")
         ToolTip(self.result_tree, "Calculated properties (SI Units)"); ToolTip(self.phase_label, "Calculated phase"); ToolTip(self.fluid_info_tcrit_label, "Critical temperature (SI units)")
         ToolTip(self.isotherms_check, "Toggle display of isotherm line(s) on P-h diagram"); ToolTip(self.isobars_check, "Toggle display of isobar line(s) on T-s diagram")
+        if hasattr(self, 'quality_lines_check'): ToolTip(self.quality_lines_check, "Toggle display of quality (x) lines inside the dome")
+        if hasattr(self, 'export_button'): ToolTip(self.export_button, "Export displayed results to CSV file")
+        if hasattr(self, 'rankine_export_button'): ToolTip(self.rankine_export_button, "Export Rankine cycle results to CSV")
+        if hasattr(self, 'refrig_export_button'): ToolTip(self.refrig_export_button, "Export Refrigeration cycle results to CSV")
+        if hasattr(self, 'custom_fluid_entry'): ToolTip(self.custom_fluid_entry, "Enter a CoolProp fluid string (e.g. HEOS::Water[0.7]&Ethanol[0.3]) and click Apply")
+        if hasattr(self, 'conv_result_label'): ToolTip(self.conv_result_label, "Result of unit conversion. Use 'Convertir' to compute.")
+        if hasattr(self, 'bin_plot_btn'): ToolTip(self.bin_plot_btn, "Plot binary bubble and dew curves (T vs mole fraction) at the given pressure")
 
     def _load_settings(self):
         logging.info(f"Attempting to load settings from {CONFIG_FILE}..."); config = configparser.ConfigParser()
@@ -893,6 +1119,102 @@ class CoolPropApp(tk.Tk):
                 self._trigger_ph_plot_update(); self._trigger_ts_plot_update()
                 self._update_psat_plot(selected_fluid) # NEW: Update P-T plot immediately
             else: self._update_fluid_info()
+
+    # --- Mixture Builder Methods ---
+    def _add_component_to_mixture(self):
+        sel = self.fluid_listbox.curselection()
+        if not sel:
+            messagebox.showerror("Selection Error", "Select a component from the fluid list to add to the mixture.", parent=self)
+            return
+        comp = self.fluid_listbox.get(sel[0])
+        try:
+            frac = float(self.mixture_fraction_var.get())
+        except Exception:
+            messagebox.showerror("Input Error", "Fraction must be a number (percent).", parent=self); return
+        if frac <= 0:
+            messagebox.showerror("Input Error", "Fraction must be positive.", parent=self); return
+        # Append and update display
+        self.mixture_components.append((comp, float(frac)))
+        self._update_mixture_display()
+
+    def _update_mixture_display(self):
+        try:
+            for it in self.mixture_tree.get_children(): self.mixture_tree.delete(it)
+            for comp, frac in self.mixture_components:
+                self.mixture_tree.insert('', tk.END, values=(comp, f"{frac:.3f}"))
+        except Exception as e:
+            logging.error(f"Could not update mixture display: {e}", exc_info=True)
+
+    def _build_mixture_string(self):
+        """Builds a CoolProp HEOS mixture string from self.mixture_components.
+        Components are given as (name, percent). We normalize to mole fractions summing to 1.
+        Returns the mixture string or raises ValueError if invalid.
+        """
+        if not self.mixture_components or len(self.mixture_components) < 2:
+            raise ValueError("A mixture must contain at least two components.")
+        comps = [c for c,_ in self.mixture_components]; fracs = [f for _,f in self.mixture_components]
+        total = sum(fracs)
+        if total <= 0: raise ValueError("Sum of fractions must be > 0")
+        # Normalize to mole fractions (accept percent input; if user already provided fractions summing to 1 it's fine)
+        norm = [f/total for f in fracs]
+        parts = []
+        for c, x in zip(comps, norm):
+            parts.append(f"{c}[{x:.6f}]")
+        mix_str = "HEOS::" + "&".join(parts)
+        return mix_str
+
+    def _apply_mixture(self):
+        try:
+            mix = self._build_mixture_string()
+        except Exception as e:
+            messagebox.showerror("Mixture Error", f"Could not build mixture: {e}", parent=self); return
+        # Apply mixture string as current fluid
+        self.fluid_var.set(mix)
+        # Update fluid info and plots
+        try:
+            self._update_fluid_info()
+        except Exception:
+            pass
+        # Refresh plots
+        self._clear_ph_plot(); self._clear_ts_plot(); self._update_psat_plot(mix)
+        self.current_fluid_for_plot = mix
+
+    def _clear_mixture(self):
+        self.mixture_components = []
+        try:
+            for it in self.mixture_tree.get_children(): self.mixture_tree.delete(it)
+        except: pass
+
+    def _apply_custom_fluid(self):
+        s = self.custom_fluid_var.get().strip()
+        if not s:
+            messagebox.showerror('Custom Fluid', 'Enter a custom CoolProp fluid string first (e.g. HEOS::Water[0.7]&Ethanol[0.3]).', parent=self)
+            return
+        # Basic validation: must contain :: or be a known fluid
+        if '::' not in s and s not in self._full_fluid_list:
+            # warn but allow
+            if not messagebox.askyesno('Custom Fluid', 'String does not look like a CoolProp fluid string. Apply anyway?', parent=self):
+                return
+        self.fluid_var.set(s)
+        try:
+            self._update_fluid_info()
+        except Exception:
+            pass
+        # Refresh plots
+        self._clear_ph_plot(); self._clear_ts_plot(); self._update_psat_plot(s)
+        self.current_fluid_for_plot = s
+
+    def _clear_custom_fluid(self):
+        self.custom_fluid_var.set('')
+        # reset to selected list fluid if possible
+        try:
+            list_items = self.fluid_listbox.get(0, tk.END)
+            if list_items:
+                sel = 0
+                self.fluid_listbox.selection_clear(0, tk.END); self.fluid_listbox.selection_set(sel); self.fluid_listbox.see(sel)
+                self.fluid_var.set(self.fluid_listbox.get(sel)); self._update_fluid_info(); self._update_psat_plot(self.fluid_var.get())
+        except Exception:
+            pass
 
     def _get_prop_code_from_display(self, d): return self.display_to_code_map.get(d, 'DEFAULT')
     def _get_prop_details(self, c): return PROPERTY_INFO.get(c.upper(), PROPERTY_INFO['DEFAULT'])
@@ -1068,6 +1390,17 @@ class CoolPropApp(tk.Tk):
                 except: pass
             else: self.ph_ax.set_title(f"P-h - {fluid_name} (No Data)")
             
+            # Draw quality lines inside dome if requested
+            if self.show_quality_lines_var.get():
+                try:
+                    qdata = self.calculator.calculate_quality_curves_ph(fluid_name)
+                    if not qdata.get('error'):
+                        for x_val, dat in qdata.get('x_lines', {}).items():
+                            try: self.ph_ax.plot(dat['h'], dat['p'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                            except: continue
+                except Exception:
+                    pass
+
             if self.show_isotherms_var.get() and self.last_si_results:
                 t_si = self.last_si_results.get('values', {}).get('T')
                 if isinstance(t_si, (int, float)):
@@ -1088,13 +1421,56 @@ class CoolPropApp(tk.Tk):
                 except: pass
             else: self.ts_ax.set_title(f"T-s - {fluid_name} (No Data)")
 
+            # Draw quality lines inside dome if requested
+            if self.show_quality_lines_var.get():
+                try:
+                    qdata = self.calculator.calculate_quality_curves_ts(fluid_name)
+                    if not qdata.get('error'):
+                        for x_val, dat in qdata.get('x_lines', {}).items():
+                            try: self.ts_ax.plot(dat['s'], dat['t'], color='grey', ls=':', lw=0.7, alpha=0.8, zorder=3)
+                            except: continue
+                except Exception:
+                    pass
+
             if self.show_isobars_var.get() and self.last_si_results:
                 p_si = self.last_si_results.get('values', {}).get('P')
                 if isinstance(p_si, (int, float)):
                     iso = self.calculator.calculate_ts_isobar(fluid_name, p_si)
                     if not iso.get('error'): self.ts_ax.plot(iso['s'], iso['t'], 'm--', lw=0.8, label=f'P={self.Q_(p_si,"Pa").to("bar").m:.2f}bar', zorder=3); self.ts_ax.legend(loc='best', fontsize='small')
             self.ts_fig.tight_layout()
-        except Exception: pass
+        except Exception:
+            pass
+
+    # --- Export CSV helpers ---
+    def _export_treeview_to_csv(self, tree, default_name="export.csv"):
+        try:
+            filename = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSV files','*.csv')], initialfile=default_name, parent=self)
+            if not filename: return
+            cols = tree['columns']
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                # header
+                headers = [tree.heading(c)['text'] for c in cols]
+                writer.writerow(headers)
+                for item in tree.get_children():
+                    row = tree.item(item)['values']
+                    writer.writerow(row)
+            messagebox.showinfo('Export', f'Results exported to {filename}', parent=self)
+        except Exception as e:
+            logging.error(f"Export CSV failed: {e}", exc_info=True)
+            messagebox.showerror('Export Error', f'Could not export CSV:\n{e}', parent=self)
+
+    def _export_results_csv(self):
+        if hasattr(self, 'result_tree'):
+            self._export_treeview_to_csv(self.result_tree, 'results.csv')
+
+    def _export_rankine_csv(self):
+        if hasattr(self, 'rankine_tree'):
+            self._export_treeview_to_csv(self.rankine_tree, 'rankine_cycle.csv')
+
+    def _export_refrig_csv(self):
+        if hasattr(self, 'refrig_tree'):
+            self._export_treeview_to_csv(self.refrig_tree, 'refrig_cycle.csv')
 
     def _clear_ph_plot(self):
         try:
@@ -1154,6 +1530,81 @@ class CoolPropApp(tk.Tk):
             if hasattr(self, 'psat_ax'):
                 self.psat_ax.clear(); self.psat_ax.set_xlabel("Temperature (T) [K]"); self.psat_ax.set_ylabel("Saturation Pressure (P) [kPa]"); self.psat_ax.set_yscale('log'); self.psat_ax.set_title("P-T Saturation Curve"); self.psat_ax.set_xlim(100, 200); self.psat_ax.set_ylim(1, 10); self.psat_fig.tight_layout(); self.psat_canvas.draw_idle()
         except: pass
+
+    def _get_components_from_fluid(self, fluid_str):
+        """Return list of component names from a CoolProp fluid string or mixture builder.
+        Supports strings like 'HEOS::A[0.5]&B[0.5]' or 'A' or 'HEOS::A&B'."""
+        if not fluid_str: return []
+        try:
+            s = fluid_str
+            # If using internal mixture builder, we may have mixture_components
+            if hasattr(self, 'mixture_components') and self.mixture_components:
+                return [c for c,_ in self.mixture_components]
+            if '::' in s:
+                s = s.split('::',1)[1]
+            parts = s.split('&')
+            comps = []
+            for p in parts:
+                # strip bracket fractions
+                if '[' in p:
+                    name = p.split('[',1)[0]
+                else:
+                    name = p
+                name = name.strip()
+                if name: comps.append(name)
+            return comps
+        except Exception:
+            return []
+
+    def _on_plot_binary_bubble_dew(self):
+        """Compute and plot bubble and dew T vs composition for a binary mixture at specified P (kPa)."""
+        fluid = self.fluid_var.get()
+        comps = self._get_components_from_fluid(fluid)
+        if len(comps) != 2:
+            messagebox.showerror('Binary Plot', 'Current fluid is not recognized as a binary mixture (2 components required).', parent=self)
+            return
+        try:
+            p_kpa = float(self.bin_p_var.get())
+        except Exception:
+            messagebox.showerror('Binary Plot', 'Enter a valid pressure in kPa.', parent=self); return
+        p_pa = self.Q_(p_kpa, 'kPa').to('Pa').m
+        A, B = comps[0], comps[1]
+        N = 41
+        xs = np.linspace(0.0, 1.0, N)
+        T_bub = []
+        T_dew = []
+        for x in xs:
+            # build mixture string with mole fraction x for A
+            mix = f'HEOS::{A}[{x:.6f}]&{B}[{(1.0-x):.6f}]'
+            try:
+                Tb = CP.PropsSI('T', 'P', p_pa, 'Q', 0, mix)
+            except Exception:
+                Tb = np.nan
+            try:
+                Td = CP.PropsSI('T', 'P', p_pa, 'Q', 1, mix)
+            except Exception:
+                Td = np.nan
+            T_bub.append(Tb if np.isfinite(Tb) else np.nan)
+            T_dew.append(Td if np.isfinite(Td) else np.nan)
+        # Plot in a new figure: T vs x (mole frac of A)
+        try:
+            fig = Figure(figsize=(6,4), dpi=100)
+            ax = fig.add_subplot(111)
+            ax.plot(xs, np.array(T_bub)-273.15, 'b-', label='Bubble (T °C)')
+            ax.plot(xs, np.array(T_dew)-273.15, 'r--', label='Dew (T °C)')
+            ax.set_xlabel(f'Mole fraction {A}')
+            ax.set_ylabel('Temperature (°C)')
+            ax.set_title(f'Binary Bubble/Dew @ {p_kpa:.3f} kPa for {A}/{B}')
+            ax.grid(True); ax.legend()
+            # show in a Tk window
+            top = tk.Toplevel(self)
+            top.title(f'Bubble/Dew: {A}/{B} @ {p_kpa} kPa')
+            canvas = FigureCanvasTkAgg(fig, master=top)
+            canvas.get_tk_widget().pack(fill='both', expand=True)
+            canvas.draw()
+        except Exception as e:
+            logging.error(f'Binary plot failed: {e}', exc_info=True)
+            messagebox.showerror('Binary Plot', f'Could not display plot: {e}', parent=self)
 
     def _update_psat_plot(self, fluid_name):
         if not fluid_name or not hasattr(self, 'psat_ax'): self._clear_psat_plot(); return
@@ -1303,6 +1754,12 @@ class CoolPropApp(tk.Tk):
         scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.refrig_tree.yview)
         self.refrig_tree.configure(yscrollcommand=scroll.set)
         scroll.grid(row=1, column=1, sticky='ns')
+        # Export button for Refrigeration results
+        refrig_btn_frame = ttk.Frame(results_frame)
+        refrig_btn_frame.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6,0))
+        refrig_btn_frame.grid_columnconfigure(0, weight=1)
+        self.refrig_export_button = ttk.Button(refrig_btn_frame, text='Export CSV', command=self._export_refrig_csv)
+        self.refrig_export_button.grid(row=0, column=0, sticky='w', padx=5)
 
     def _clear_refrig_results(self):
         if hasattr(self, 'refrig_tree'):
